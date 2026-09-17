@@ -6,7 +6,17 @@ import pandas as pd
 import pickle
 import streamlit as st
 
-from model_common import MODEL_DIR, load_sources, prepare_frame
+from model_common import (
+    CUSTOMER_RAW_HISTORY_COLUMNS,
+    DRIVER_RAW_LEAK_COLUMNS,
+    MODEL_DIR,
+    add_engineered_features,
+    customer_history_snapshot,
+    driver_history_snapshot,
+    load_sources,
+    prepare_frame,
+    route_history_snapshot,
+)
 from train_cancellation_model import train_model as train_cancellation_model
 from train_driver_delay_model import train_model as train_driver_delay_model
 from train_fare_model import train_model as train_fare_model
@@ -14,7 +24,7 @@ from train_outcome_model import train_model as train_outcome_model
 
 
 st.set_page_config(
-    page_title="Rapido Mobility Insights",
+    page_title="Rapido Intelligent Mobility Insights",
     page_icon="R",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -33,7 +43,7 @@ def load_data():
 def booking_features(bookings):
     frame = bookings.copy()
     frame["booking_date"] = pd.to_datetime(frame["booking_date"])
-    frame["booking_time"] = pd.to_datetime(frame["booking_time"])
+    frame["booking_time"] = pd.to_datetime(frame["booking_time"], format="%H:%M:%S")
     frame["booking_hour"] = frame["booking_time"].dt.hour
     frame["booking_month"] = frame["booking_date"].dt.month
     frame["is_peak_time"] = frame["booking_hour"].isin([7, 8, 9, 17, 18, 19, 20]).astype(int)
@@ -41,6 +51,30 @@ def booking_features(bookings):
     frame["fare_markup"] = frame["booking_value"] / frame["base_fare"].clip(lower=0.01)
     frame["surge_cost"] = frame["surge_multiplier"] - 1
     return frame
+
+
+def attach_customer_driver_history(frame, customers, drivers, all_bookings):
+    """Merge customer/driver/route context onto a hypothetical new booking row.
+
+    Mirrors model_common.prepare_frame's column set (raw history columns dropped, replaced
+    by the *_prior_* snapshot columns, plus the engineered composite scores) so the row
+    lines up with what each model was trained on. Reusing customers.csv/drivers.csv/
+    bookings.csv's full history here is safe: for a booking that has not happened yet,
+    every booking behind it is real past data (see model_common.customer_history_snapshot
+    for the training-vs-scoring distinction). all_bookings is the full bookings.csv table,
+    used only to look up how well-travelled the row's route is.
+    """
+    customers_clean = customers.drop(columns=CUSTOMER_RAW_HISTORY_COLUMNS, errors="ignore")
+    drivers_clean = drivers.drop(columns=DRIVER_RAW_LEAK_COLUMNS, errors="ignore")
+    frame = frame.merge(customers_clean, on="customer_id", how="left")
+    frame = frame.merge(customer_history_snapshot(customers), on="customer_id", how="left")
+    frame = frame.merge(drivers_clean, on="driver_id", how="left", suffixes=("", "_driver"))
+    frame = frame.merge(driver_history_snapshot(drivers), on="driver_id", how="left")
+    frame = frame.merge(
+        route_history_snapshot(all_bookings), on=["pickup_location", "drop_location"], how="left"
+    )
+    frame["route_prior_bookings"] = frame["route_prior_bookings"].fillna(0)
+    return add_engineered_features(frame)
 
 
 def train_models():
@@ -70,8 +104,8 @@ def score_row(model_bundle, values):
     return model, row
 
 
-st.title("Rapido Mobility Insights")
-st.caption("Decision support for ride outcomes, fares, customer cancellation risk, and driver reliability")
+st.title("Rapido Intelligent Mobility Insights")
+#st.caption("Decision support for ride outcomes, fares, customer cancellation risk, and driver reliability")
 
 try:
     bookings, customers, drivers, locations = load_data()
@@ -81,56 +115,46 @@ except Exception as error:
     st.stop()
 
 with st.sidebar:
-    st.subheader("Network snapshot")
+    st.subheader("KPIs")
     st.metric("Bookings", f"{len(bookings):,}")
     st.metric("Cancellation rate", f"{(bookings['booking_status'].eq('Cancelled').mean() * 100):.1f}%")
     st.metric("Cities", bookings["city"].nunique())
     st.divider()
-    st.caption("Models are loaded from disk after the first training run.")
+    #st.caption("Models are loaded from disk after the first training run.")
 
 tab_overview, tab_performance, tab_cancellation, tab_outcome, tab_fare, tab_driver = st.tabs(
     ["Overview", "Model performance", "Customer risk", "Ride outcomes", "Fare forecast", "Driver reliability"]
 )
 
+WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
 with tab_overview:
     left, right = st.columns([1.1, 1])
     with left:
-        st.subheader("Ride patterns")
+        st.subheader("Ride patterns by hour")
         hourly = bookings.groupby("hour_of_day").size().rename("Bookings")
         st.line_chart(hourly)
     with right:
         st.subheader("Outcome mix")
         outcome_mix = bookings["booking_status"].value_counts().rename_axis("Status").to_frame("Bookings")
         st.bar_chart(outcome_mix)
-    st.subheader("Cancellation by city")
-    city_cancel = bookings.assign(cancelled=bookings["booking_status"].eq("Cancelled")).groupby("city")["cancelled"].mean().sort_values(ascending=False)
-    st.bar_chart(city_cancel)
 
-    st.subheader("Cancellation heatmap")
-    heatmap_source = bookings.assign(
-        cancelled=bookings["booking_status"].eq("Cancelled").astype(int)
-    )
-    cancellation_heatmap = heatmap_source.pivot_table(
-        index="city",
-        columns="hour_of_day",
-        values="cancelled",
-        aggfunc="mean",
-        fill_value=0,
-    )
-    st.dataframe(
-        cancellation_heatmap.style.format("{:.1%}").background_gradient(cmap="OrRd"),
-        use_container_width=True,
-    )
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Ride volume by weekday")
+        weekday_volume = bookings.groupby("day_of_week").size().reindex(WEEKDAY_ORDER).rename("Bookings")
+        st.bar_chart(weekday_volume)
+    with right:
+        st.subheader("Cancellation by city")
+        city_cancel = bookings.assign(cancelled=bookings["booking_status"].eq("Cancelled")).groupby("city")["cancelled"].mean().sort_values(ascending=False)
+        st.bar_chart(city_cancel)
 
+    
     left, right = st.columns(2)
     with left:
         st.subheader("Distance versus fare")
         distance_fare = bookings[["ride_distance_km", "booking_value"]].copy()
-        distance_fare["distance_band"] = pd.cut(
-            distance_fare["ride_distance_km"],
-            bins=[0, 5, 10, 20, np.inf],
-            labels=["0-5 km", "5-10 km", "10-20 km", "20+ km"],
-        )
+       
         st.scatter_chart(distance_fare, x="ride_distance_km", y="booking_value")
         st.caption(f"Correlation: {bookings['ride_distance_km'].corr(bookings['booking_value']):.2f}")
     with right:
@@ -163,12 +187,12 @@ with tab_overview:
     st.subheader("Pickup and drop activity")
     location_activity = bookings.groupby(["pickup_location", "drop_location"]).size().nlargest(20).rename("Bookings")
     st.dataframe(location_activity.reset_index(), use_container_width=True, hide_index=True)
-    if "payment_method" not in bookings.columns:
-        st.caption("Payment-method usage is unavailable because the source bookings file has no payment_method column.")
+    #if "payment_method" not in bookings.columns:
+      #  st.caption("Payment-method usage is unavailable because the source bookings file has no payment_method column.")
 
 with tab_performance:
     st.subheader("Saved model performance")
-    st.caption("Metrics are calculated on the held-out test split during each model's training script.")
+    #st.caption("Metrics are calculated on the held-out test split during each model's training script.")
     metrics = bundle["metrics"]
     performance_rows = []
     for name, values in metrics.items():
@@ -180,7 +204,8 @@ with tab_performance:
                 "Accuracy": values["accuracy"],
                 "Precision (macro)": values["precision_macro"],
                 "Recall (macro)": values["recall_macro"],
-                "F1 (macro)": values["f1_macro"],
+                "F1 (macro)": values["f1_macro"]#,
+                #"AUC": values.get("roc_auc"),
             })
         performance_rows.append(row)
     performance_table = pd.DataFrame(performance_rows).set_index("Model")
@@ -190,20 +215,38 @@ with tab_performance:
             "Precision (macro)": "{:.1%}",
             "Recall (macro)": "{:.1%}",
             "F1 (macro)": "{:.1%}",
+            #"AUC": "{:.3f}",
             "RMSE": "{:.2f}",
             "MAE": "{:.2f}",
             "R2": "{:.3f}",
         }),
         use_container_width=True,
     )
-    st.subheader("Classification comparison")
-    classification_metrics = performance_table.drop(columns=["RMSE", "MAE", "R2"], errors="ignore")
-    st.bar_chart(classification_metrics)
-    st.info("Accuracy, precision, recall, and F1 are macro-averaged for classification models so minority classes are represented fairly. Fare forecasting uses RMSE, MAE, and R2.")
+    #st.subheader("Classification comparison")
+    #classification_metrics = performance_table.drop(columns=["RMSE", "MAE", "R2", "AUC"], errors="ignore")
+    #st.bar_chart(classification_metrics)
+    #st.info("Accuracy, precision, recall, and F1 are macro-averaged for classification models so minority classes are represented fairly. AUC is macro one-vs-rest for the 3-class outcome model. Fare forecasting uses RMSE, MAE, and R2.")
+
+    st.subheader("Confusion matrices")
+    #st.caption("Rows are the actual outcome, columns are the model's prediction, on the held-out test split.")
+    confusion_cols = st.columns(3)
+    classification_models = [
+        (name, values) for name, values in metrics.items() if "confusion_matrix" in values
+    ]
+    for col, (name, values) in zip(confusion_cols, classification_models):
+        with col:
+            st.markdown(f"**{values['model']}**")
+            labels = values["confusion_matrix_labels"]
+            matrix = pd.DataFrame(
+                values["confusion_matrix"],
+                index=[f"Actual {label}" for label in labels],
+                columns=[f"Predicted {label}" for label in labels],
+            )
+            st.dataframe(matrix, use_container_width=True)
 
 with tab_cancellation:
     st.subheader("Customer cancellation risk")
-    st.write("Estimate cancellation probability from customer history, booking conditions, peak-time behavior, and pricing signals.")
+    #st.write("Estimate cancellation probability from customer history, booking conditions, peak-time behavior, and pricing signals.")
     customer_id = st.selectbox("Customer", sorted(customers["customer_id"].unique()))
     customer = customers.loc[customers["customer_id"].eq(customer_id)].iloc[0]
     c1, c2, c3 = st.columns(3)
@@ -212,17 +255,18 @@ with tab_cancellation:
     c3.metric("Average rating", f"{customer['avg_customer_rating']:.1f}")
     booking = bookings.iloc[0].copy()
     booking["customer_id"] = customer_id
-    values = booking_features(pd.DataFrame([booking])).merge(customers, on="customer_id", how="left").merge(drivers, on="driver_id", how="left", suffixes=("", "_driver")).iloc[0].to_dict()
+    row = attach_customer_driver_history(booking_features(pd.DataFrame([booking])), customers, drivers, bookings)
+    values = row.iloc[0].to_dict()
     model, columns = bundle["cancellation"]
     probability = float(model.predict_proba(pd.DataFrame([values]).reindex(columns=columns))[0, 1])
     st.metric("Predicted cancellation probability", f"{probability:.1%}")
-    st.progress(min(probability, 1.0))
-    st.info("Use the probability as a prioritization signal, not as a guarantee of customer intent.")
+    #st.progress(min(probability, 1.0))
+    #st.info("Use the probability as a prioritization signal, not as a guarantee of customer intent.")
 
 with tab_outcome:
     st.subheader("Ride outcome prediction")
-    st.write("Estimate whether a booking is likely to complete, cancel, or become incomplete.")
-    row = booking_features(bookings.iloc[[0]]).merge(customers, on="customer_id", how="left").merge(drivers, on="driver_id", how="left", suffixes=("", "_driver"))
+    #st.write("Estimate whether a booking is likely to complete, cancel, or become incomplete.")
+    row = attach_customer_driver_history(booking_features(bookings.iloc[[0]]), customers, drivers, bookings)
     model, columns = bundle["outcome"]
     probabilities = model.predict_proba(row.reindex(columns=columns))[0]
     outcome_table = pd.DataFrame({"Outcome": model.classes_, "Probability": probabilities}).set_index("Outcome")
@@ -238,11 +282,11 @@ with tab_fare:
     fare_row["ride_distance_km"] = distance
     fare_row["surge_multiplier"] = surge
     fare_row["vehicle_type"] = vehicle
-    fare_row = booking_features(fare_row).merge(customers, on="customer_id", how="left").merge(drivers, on="driver_id", how="left", suffixes=("", "_driver"))
+    fare_row = attach_customer_driver_history(booking_features(fare_row), customers, drivers, bookings)
     model, columns = bundle["fare"]
     estimate = float(model.predict(fare_row.reindex(columns=columns))[0])
     st.metric("Estimated booking value", f"Rs {estimate:,.2f}")
-    st.caption("This forecast is based on the trained local model and the selected scenario.")
+    #st.caption("This forecast is based on the trained model")
 
 with tab_driver:
     st.subheader("Driver reliability")
@@ -252,9 +296,10 @@ with tab_driver:
     d1.metric("Acceptance rate", f"{driver['acceptance_rate']:.1%}")
     d2.metric("Delay rate", f"{driver['delay_rate']:.1%}")
     d3.metric("Driver rating", f"{driver['avg_driver_rating']:.1f}")
-    row = booking_features(bookings.iloc[[0]]).merge(drivers, on="driver_id", how="left", suffixes=("", "_driver"))
+    row = bookings.iloc[[0]].copy()
     row["driver_id"] = driver_id
+    row = attach_customer_driver_history(booking_features(row), customers, drivers, bookings)
     model, columns = bundle["delay"]
     delay_probability = float(model.predict_proba(row.reindex(columns=columns))[0, 1])
     st.metric("Predicted delay/incomplete risk", f"{delay_probability:.1%}")
-    st.progress(min(delay_probability, 1.0))
+    #st.progress(min(delay_probability, 1.0))
